@@ -2,4 +2,333 @@
 title: "finalized r script"
 output: html_document
 ---
+# Gout and Coronary Heart Disease Analysis using NHANES 2017-2018 Data
+#-------------------------------------------------------------------------------
+# Block 0: Setup - Load Packages and Set Survey Years
+#-------------------------------------------------------------------------------
+# Install packages if you haven't already
+# install.packages(c("dplyr", "nhanesA", "data.table", "car", "jtools",
+#                    "tableone", "ggplot2", "DataExplorer", "purrr",
+#                    "broom", "effects", "ggeffects"))
 
+# Load necessary libraries
+library(dplyr)
+library(nhanesA)
+library(data.table)
+library(car)          # For recoding variables (though less used now)
+library(jtools)       # For summarizing regression models & plots
+library(tableone)     # For creating descriptive tables (Table 1)
+library(ggplot2)      # For plotting
+library(DataExplorer) # For visualizing missing data (optional)
+library(purrr)        # For reduce function used in merging
+library(broom)        # For tidying model outputs
+library(effects)      # Sometimes needed by jtools/ggeffects
+library(ggeffects)    # For predicted probabilities
+
+# Define NHANES survey cycle(s)
+nhanes_years <- c("2017-2018")
+nhanes_letters <- c("J") # Corresponding letter suffix for 2017-2018
+
+cat("--- Block 0: Setup Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Block 1: Data Download
+#-------------------------------------------------------------------------------
+cat("--- Starting Block 1: Data Download ---\n")
+
+# Define variables needed from each dataset
+# Demographics (DEMO_J)
+demo_vars <- c("SEQN", "RIAGENDR", "RIDAGEYR", "RIDRETH1", "DMDMARTL", "INDHHIN2")
+# Medical Conditions Questionnaire (MCQ_J) - Gout and CHD
+mcq_vars <- c("SEQN", "MCQ160N", "MCQ160C") # MCQ160N: Gout, MCQ160C: CHD
+# Body Measures (BMX_J) - BMI
+bmx_vars <- c("SEQN", "BMXBMI")
+# Diabetes Questionnaire (DIQ_J)
+diq_vars <- c("SEQN", "DIQ010") # DIQ010: Doctor told you have diabetes
+# Smoking Questionnaire (SMQ_J)
+smq_vars <- c("SEQN", "SMQ020") # SMQ020: Smoked at least 100 cigarettes in life
+# Blood Pressure Questionnaire (BPQ_J)
+bpq_vars <- c("SEQN", "BPQ020") # BPQ020: Ever told you had high blood pressure
+# Hospital Utilization & Access to Care (HUQ_J) - Less used in final model but downloaded
+# huq_vars <- c("SEQN", "HUQ030") # HUQ030: Place to go when sick
+# Health Insurance (HIQ_J) - Less used in final model but downloaded
+# hiq_vars <- c("SEQN", "HIQ011") # HIQ011: Covered by health insurance
+# Diet Behavior & Nutrition (DBQ_J) - Less used in final model but downloaded
+# dbq_vars <- c("SEQN", "DBQ700") # DBQ700: How healthy is the diet
+
+# --- Download using nhanesA ---
+safe_nhanes_download <- function(dataset_code, vars_to_select) {
+  cat("Downloading", dataset_code, "data...\n")
+  data_raw <- tryCatch(
+    nhanes(dataset_code),
+    error = function(e) {
+      warning("Failed to download ", dataset_code, ". Error: ", e$message)
+      return(NULL)
+    }
+  )
+  if (!is.null(data_raw)) {
+    if (!"SEQN" %in% colnames(data_raw)) { warning(paste("SEQN not found in", dataset_code)); return(NULL) }
+    existing_vars <- intersect(vars_to_select, colnames(data_raw))
+    if (length(existing_vars) < length(vars_to_select)) { missing_vars <- setdiff(vars_to_select, colnames(data_raw)); warning("Variables missing from ", dataset_code, ": ", paste(missing_vars, collapse=", ")) }
+    vars_final_select <- unique(c("SEQN", existing_vars)); vars_final_select <- vars_final_select[vars_final_select %in% colnames(data_raw)]
+    if(length(vars_final_select) <= 1 && !"SEQN" %in% vars_final_select) { warning(paste("No requested vars found in ", dataset_code, ". Skipping.")); return(NULL) }
+    return(data_raw %>% select(all_of(vars_final_select)))
+  } else { return(NULL) }
+}
+
+demo_raw <- safe_nhanes_download("DEMO_J", demo_vars)
+mcq_raw  <- safe_nhanes_download("MCQ_J", mcq_vars)
+bmx_raw  <- safe_nhanes_download("BMX_J", bmx_vars)
+diq_raw  <- safe_nhanes_download("DIQ_J", diq_vars)
+smq_raw  <- safe_nhanes_download("SMQ_J", smq_vars)
+bpq_raw  <- safe_nhanes_download("BPQ_J", bpq_vars)
+
+cat("--- Block 1: Data Download Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Block 2: Data Merging
+#-------------------------------------------------------------------------------
+cat("--- Starting Block 2: Data Merging ---\n")
+data_names <- c("demo_raw", "mcq_raw", "bmx_raw", "diq_raw", "smq_raw", "bpq_raw")
+data_list <- mget(data_names[sapply(data_names, exists)])
+data_list <- data_list[!sapply(data_list, is.null)]
+if(length(data_list) == 0) { stop("No valid data frames downloaded to merge.") }
+has_seqn <- sapply(data_list, function(df) "SEQN" %in% colnames(df))
+if(!all(has_seqn)) { stop("SEQN column missing in: ", paste(names(data_list)[!has_seqn], collapse=", ")) }
+merged_data <- data_list %>% purrr::reduce(full_join, by = "SEQN")
+cat("Initial merged dataset dimensions:", dim(merged_data), "\n")
+cat("--- Block 2: Data Merging Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Block 3: Data Cleaning and Preprocessing
+#-------------------------------------------------------------------------------
+cat("--- Starting Block 3: Cleaning and Preprocessing ---\n")
+essential_cols <- c("MCQ160C", "MCQ160N", "RIDAGEYR")
+if (!all(essential_cols %in% colnames(merged_data))) { stop("Essential columns missing: ", paste(essential_cols[!essential_cols %in% colnames(merged_data)], collapse=", ")) }
+
+nhanes_clean_temp <- merged_data %>%
+  mutate(
+    chd_status = case_when(MCQ160C == "Yes" ~ 1, MCQ160C == "No" ~ 0, TRUE ~ NA_real_),
+    gout_status = case_when(MCQ160N == "Yes" ~ 1, MCQ160N == "No" ~ 0, TRUE ~ NA_real_),
+    age = RIDAGEYR,
+    gender = factor(RIAGENDR, levels = c("Male", "Female")),
+    race = factor(RIDRETH1, levels = c("Mexican American", "Other Hispanic", "Non-Hispanic White", "Non-Hispanic Black", "Other Race - Including Multi-Racial")),
+    bmi = BMXBMI,
+    diabetes = case_when(as.character(DIQ010) %in% c("Yes", "1") ~ 1, as.character(DIQ010) %in% c("No", "2", "Borderline", "3") ~ 0, TRUE ~ NA_real_),
+    smoking_ever = case_when(as.character(SMQ020) %in% c("Yes", "1") ~ 1, as.character(SMQ020) %in% c("No", "2") ~ 0, TRUE ~ NA_real_),
+    hypertension = case_when(as.character(BPQ020) %in% c("Yes", "1") ~ 1, as.character(BPQ020) %in% c("No", "2") ~ 0, TRUE ~ NA_real_)
+  ) %>%
+  select(SEQN, chd_status, gout_status, age, gender, race, bmi, diabetes, smoking_ever, hypertension) %>%
+  filter(age >= 20 | is.na(age))
+
+cat("\n--- Diagnostics Before Filtering NA Outcome/Exposure ---\n")
+cat("Dimensions BEFORE filtering NA outcome/exposure:", dim(nhanes_clean_temp), "\n")
+cat("Table CHD Status:\n"); print(table(nhanes_clean_temp$chd_status, useNA = "ifany"))
+cat("Table Gout Status:\n"); print(table(nhanes_clean_temp$gout_status, useNA = "ifany"))
+n_complete_outcome_exposure <- sum(!is.na(nhanes_clean_temp$chd_status) & !is.na(nhanes_clean_temp$gout_status))
+cat("Number rows BOTH CHD/Gout NOT NA:", n_complete_outcome_exposure, "\n")
+cat("--- End Diagnostics ---\n\n")
+if(n_complete_outcome_exposure == 0) { stop("Stopping: No participants have complete data for both CHD and Gout status.") }
+
+nhanes_analysis <- nhanes_clean_temp %>% filter(!is.na(chd_status) & !is.na(gout_status))
+cat("Dataset dimensions AFTER filtering NA outcome/exposure:", dim(nhanes_analysis), "\n")
+
+nhanes_analysis <- nhanes_analysis %>%
+  mutate(
+    chd_status_f = factor(chd_status, levels = c(0, 1), labels = c("No CHD", "CHD")),
+    gout_status_f = factor(gout_status, levels = c(0, 1), labels = c("No Gout", "Gout")),
+    diabetes_f = factor(diabetes, levels = c(0, 1), labels = c("No Diabetes", "Diabetes")),
+    smoking_ever_f = factor(smoking_ever, levels = c(0, 1), labels = c("Never Smoked", "Ever Smoked")),
+    hypertension_f = factor(hypertension, levels = c(0, 1), labels = c("No HTN", "HTN"))
+  )
+
+safe_relevel <- function(df, col_name, ref_level) { # Function definition moved earlier if needed
+  if (col_name %in% names(df) && is.factor(df[[col_name]])) {
+    if (ref_level %in% levels(df[[col_name]])) { df[[col_name]] <- relevel(df[[col_name]], ref = ref_level); cat("Set ref level for", col_name, "\n") }
+    else { warning("Ref level '", ref_level, "' not found in factor '", col_name, "'") }
+  } else { if(nrow(df) > 0) warning("Column '", col_name, "' not found/not factor.") } ; return(df)
+}
+nhanes_analysis <- nhanes_analysis %>% safe_relevel("gout_status_f", "No Gout") %>% safe_relevel("race", "Non-Hispanic White") %>% safe_relevel("gender", "Male")
+cat("--- Block 3: Cleaning and Preprocessing Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Block 4: Descriptive Statistics (Table 1)
+#-------------------------------------------------------------------------------
+cat("--- Starting Block 4: Descriptive Statistics (Table 1) ---\n")
+table1 <- NULL # Initialize
+table1_vars <- c("age", "gender", "race", "bmi", "gout_status_f", "diabetes_f", "smoking_ever_f", "hypertension_f")
+table1_cat_vars <- c("gender", "race", "gout_status_f", "diabetes_f", "smoking_ever_f", "hypertension_f")
+if(nrow(nhanes_analysis) == 0) { warning("Analysis dataset empty, cannot create Table 1.") } else {
+    table1_vars_exist <- table1_vars[table1_vars %in% names(nhanes_analysis)]; table1_cat_vars_exist <- table1_cat_vars[table1_cat_vars %in% names(nhanes_analysis)]
+    if(length(table1_vars_exist) == 0) { warning("No Table 1 vars exist.") } else {
+        if ("chd_status_f" %in% names(nhanes_analysis) && length(levels(droplevels(nhanes_analysis$chd_status_f))) > 1) {
+            table1 <- CreateTableOne(vars = table1_vars_exist, data = nhanes_analysis, factorVars = table1_cat_vars_exist, strata = "chd_status_f", test = TRUE, addOverall = TRUE)
+            cat("Descriptive Statistics (Table 1 - Stratified by CHD Status):\n"); print(table1, smd = TRUE, printToggle = FALSE, showAllLevels = TRUE, missing = TRUE, varLabels = TRUE)
+        } else { warning("Outcome missing or has <= 1 level. Creating overall table."); table1 <- CreateTableOne(vars = table1_vars_exist, data = nhanes_analysis, factorVars = table1_cat_vars_exist, test = FALSE); cat("Descriptive Statistics (Overall Only):\n"); print(table1, smd = FALSE, showAllLevels = TRUE, missing = TRUE, varLabels = TRUE) } } }
+cat("--- Block 4: Descriptive Statistics Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Block 5: Inferential Statistical Analysis (Main Models)
+#-------------------------------------------------------------------------------
+cat("--- Starting Block 5: Inferential Statistical Analysis ---\n")
+unadj_model <- NULL; adj_model <- NULL; contingency_table <- NULL; chisq_result <- NULL
+if(nrow(nhanes_analysis) == 0) { warning("Analysis dataset empty, skipping inferential analysis.") } else {
+    # Bivariable
+    cat("\n--- Bivariable Analysis: Gout vs CHD ---\n")
+    if ("gout_status_f" %in% names(nhanes_analysis) && "chd_status_f" %in% names(nhanes_analysis) && length(levels(droplevels(nhanes_analysis$gout_status_f))) > 1 && length(levels(droplevels(nhanes_analysis$chd_status_f))) > 1) {
+        contingency_table <- table(Gout = nhanes_analysis$gout_status_f, CHD = nhanes_analysis$chd_status_f); cat("Contingency Table:\n"); print(contingency_table)
+        chisq_result <- tryCatch(chisq.test(contingency_table), warning = function(w) { message("Warning: ", w$message); tryCatch(chisq.test(contingency_table, simulate.p.value = TRUE), error=function(e) NULL)}); if(!is.null(chisq_result)) {cat("\nChi-squared Test:\n"); print(chisq_result)}
+    } else { warning("Cannot perform Chi-sq: Gout/CHD factors missing or <2 levels.") }
+    if("chd_status" %in% names(nhanes_analysis) && "gout_status_f" %in% names(nhanes_analysis)){
+        unadj_data_subset <- nhanes_analysis %>% filter(!is.na(chd_status) & !is.na(gout_status_f))
+        if (length(unique(unadj_data_subset$chd_status)) > 1 && length(levels(droplevels(unadj_data_subset$gout_status_f))) > 1 && nrow(unadj_data_subset) > 10) {
+            unadj_model <- glm(chd_status ~ gout_status_f, family = binomial(link = "logit"), data = nhanes_analysis)
+            cat("\nUnadjusted Logistic Regression:\n"); summ(unadj_model, exp = TRUE, confint = TRUE, digits = 3)
+        } else { warning("Skipping unadjusted glm: Insufficient levels/data.") } } else { warning("Skipping unadjusted glm: Required columns missing.") }
+    # Multivariable
+    cat("\n--- Multivariable Analysis: Adjusted Logistic Regression ---\n")
+    predictors <- c("gout_status_f", "age", "gender", "race", "bmi", "diabetes_f", "smoking_ever_f", "hypertension_f"); outcome <- "chd_status"; required_vars_adj <- c(outcome, predictors)
+    missing_cols <- required_vars_adj[!required_vars_adj %in% names(nhanes_analysis)]
+     if(length(missing_cols) > 0) { warning(paste("Skipping adjusted model: Columns missing:", paste(missing_cols, collapse=", "))) } else {
+        adj_data_subset <- nhanes_analysis %>% select(all_of(required_vars_adj)) %>% na.omit(); cat("Subset dimensions for adjusted model:", dim(adj_data_subset), "\n")
+        if (length(unique(adj_data_subset[[outcome]])) <= 1) { warning("Skipping adjusted glm: Outcome has <= 1 level.") } else if (nrow(adj_data_subset) < 20) { warning("Skipping adjusted glm: Too few complete observations (<20).") } else {
+            factors_in_model <- predictors[sapply(adj_data_subset[,predictors], is.factor)]; valid_factors <- c(); problematic_factors <- c()
+            for (fac in factors_in_model) { n_levels <- length(levels(droplevels(adj_data_subset[[fac]]))); cat("Checking factor:", fac, "Levels:", n_levels, "\n"); if (n_levels > 1) valid_factors <- c(valid_factors, fac) else problematic_factors <- c(problematic_factors, fac) }; if(length(problematic_factors > 0)) warning(paste("Factors excluded:", paste(problematic_factors, collapse=", ")))
+            continuous_vars_in_model <- predictors[sapply(adj_data_subset[,predictors], is.numeric)]; valid_continuous <- continuous_vars_in_model; final_predictors <- c(valid_factors, valid_continuous)
+            if(length(final_predictors) > 0) { formula_str <- paste(outcome, "~", paste(final_predictors, collapse = " + ")); cat("Fitting adj model:", formula_str, "\n"); adj_model <- glm(as.formula(formula_str), family = binomial(link = "logit"), data = adj_data_subset); cat("\nAdjusted Model Results:\n"); summ(adj_model, exp = TRUE, confint = TRUE, digits = 3, vif = TRUE) } else { warning("Skipping adj model: No valid predictors.") } } } }
+cat("\n--- Block 5: Inferential Statistical Analysis Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Block 6: Visualization (Basic Bar Plot)
+#-------------------------------------------------------------------------------
+cat("--- Starting Block 6: Visualization (Basic Bar Plot) ---\n")
+p <- NULL
+if(nrow(nhanes_analysis) > 0 && "gout_status_f" %in% names(nhanes_analysis) && "chd_status_f" %in% names(nhanes_analysis)) { if (length(levels(droplevels(nhanes_analysis$gout_status_f))) > 0 && length(levels(droplevels(nhanes_analysis$chd_status_f))) > 0) {
+    p <- ggplot(nhanes_analysis, aes(x = gout_status_f, fill = chd_status_f)) + geom_bar(position = "fill") + scale_y_continuous(labels = scales::percent_format()) + labs(title = "Proportion of CHD by Gout Status", x = "Gout Status", y = "Proportion", fill = "CHD Status") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5)); print(p); cat("Basic Bar Plot generated.\n") } else { warning("Skipping bar plot: Factors have no levels.") }
+} else { warning("Skipping bar plot: Dataset empty/missing columns.") }
+cat("--- Block 6: Visualization Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Blocks 7-11: Additional Analyses
+#-------------------------------------------------------------------------------
+
+# --- Block 7: Interaction ---
+cat("\n--- Starting Block 7: Interaction Analysis (Gout * Gender) ---\n")
+interaction_model_gender <- NULL
+if(exists("nhanes_analysis") && nrow(nhanes_analysis) > 0) { required_vars_int_gender <- c("chd_status", "gout_status_f", "age", "gender", "race", "bmi", "diabetes_f", "smoking_ever_f", "hypertension_f"); missing_cols_int_gender <- required_vars_int_gender[!required_vars_int_gender %in% names(nhanes_analysis)]; if(length(missing_cols_int_gender) > 0) { warning(paste("Skip G*G interaction: Cols missing:", paste(missing_cols_int_gender, collapse=", "))) } else {
+    adj_data_subset_int_gender <- nhanes_analysis %>% select(all_of(required_vars_int_gender)) %>% na.omit(); cat("Subset dimensions G*G interaction:", dim(adj_data_subset_int_gender), "\n"); if (length(unique(adj_data_subset_int_gender$chd_status)) <= 1) { warning("Skip G*G: Outcome <= 1 level.") } else if (length(levels(droplevels(factor(adj_data_subset_int_gender$gout_status_f)))) <= 1) { warning("Skip G*G: Gout <= 1 level.") } else if (length(levels(droplevels(factor(adj_data_subset_int_gender$gender)))) <= 1) { warning("Skip G*G: Gender <= 1 level.") } else if (nrow(adj_data_subset_int_gender) < 20) { warning("Skip G*G: Too few complete obs.") } else { cat("Fitting G*G interaction model...\n"); interaction_model_gender <- glm(chd_status ~ gout_status_f * gender + age + race + bmi + diabetes_f + smoking_ever_f + hypertension_f, family = binomial(link = "logit"), data = adj_data_subset_int_gender); summ(interaction_model_gender, exp = TRUE, confint = TRUE, digits = 3) } }
+} else { warning("Skipping Interaction: nhanes_analysis empty/missing.") }
+cat("--- Block 7: Interaction Analysis Complete ---\n")
+
+# --- Block 8: Stratified ---
+cat("\n--- Starting Block 8: Stratified Analysis by Gender ---\n")
+adj_model_males <- NULL; adj_model_females <- NULL
+if(exists("nhanes_analysis") && nrow(nhanes_analysis) > 0 && "gender" %in% names(nhanes_analysis)) { required_vars_strat <- c("chd_status", "gout_status_f", "age", "race", "bmi", "diabetes_f", "smoking_ever_f", "hypertension_f")
+    # Males
+    males_data <- nhanes_analysis %>% filter(gender == "Male"); cat("\nChecking subset Males: N =", nrow(males_data), "\n"); missing_cols_males <- required_vars_strat[!required_vars_strat %in% names(males_data)]; if(length(missing_cols_males) > 0) { warning(paste("Skip Males model: Cols missing:", paste(missing_cols_males, collapse=", "))) } else { males_subset_complete <- males_data %>% select(all_of(required_vars_strat)) %>% na.omit(); cat("Complete cases Males:", nrow(males_subset_complete), "\n"); if(nrow(males_subset_complete) > 10 && length(unique(males_subset_complete$chd_status)) > 1 && length(levels(droplevels(factor(males_subset_complete$gout_status_f)))) > 1) { adj_model_males <- glm(chd_status ~ gout_status_f + age + race + bmi + diabetes_f + smoking_ever_f + hypertension_f, family = binomial(link = "logit"), data = males_subset_complete); cat("\nAdj Model MALES:\n"); summ(adj_model_males, exp = TRUE, confint = TRUE, digits = 3) } else { warning("Skip Males model: Insufficient data/levels.") } }
+    # Females
+    females_data <- nhanes_analysis %>% filter(gender == "Female"); cat("\nChecking subset Females: N =", nrow(females_data), "\n"); missing_cols_females <- required_vars_strat[!required_vars_strat %in% names(females_data)]; if(length(missing_cols_females) > 0) { warning(paste("Skip Females model: Cols missing:", paste(missing_cols_females, collapse=", "))) } else { females_subset_complete <- females_data %>% select(all_of(required_vars_strat)) %>% na.omit(); cat("Complete cases Females:", nrow(females_subset_complete), "\n"); if(nrow(females_subset_complete) > 10 && length(unique(females_subset_complete$chd_status)) > 1 && length(levels(droplevels(factor(females_subset_complete$gout_status_f)))) > 1) { adj_model_females <- glm(chd_status ~ gout_status_f + age + race + bmi + diabetes_f + smoking_ever_f + hypertension_f, family = binomial(link = "logit"), data = females_subset_complete); cat("\nAdj Model FEMALES:\n"); summ(adj_model_females, exp = TRUE, confint = TRUE, digits = 3) } else { warning("Skip Females model: Insufficient data/levels.") } }
+} else { warning("Skipping Stratified: nhanes_analysis empty/missing or gender missing.") }
+cat("--- Block 8: Stratified Analysis Complete ---\n")
+
+# --- Block 9: Sensitivity ---
+cat("\n--- Starting Block 9: Sensitivity Analysis (Age Categories) ---\n")
+adj_model_agecat <- NULL
+if(exists("nhanes_analysis") && nrow(nhanes_analysis) > 0) {
+    nhanes_analysis_agecat <- nhanes_analysis %>% { if (!"age" %in% names(.) || !is.numeric(.$age)) {warning("Age missing/not numeric"); mutate(., age_group = factor(NA))} else { mutate(., age_group = cut(age, breaks = c(19, 39, 59, 79, Inf), labels = c("20-39", "40-59", "60-79", "80+"), right = TRUE, include.lowest = TRUE)) }} %>% { if ("age_group" %in% names(.) && "20-39" %in% levels(.$age_group)) { mutate(., age_group = relevel(age_group, ref = "20-39"))} else { . }}
+    required_vars_agecat <- c("chd_status", "gout_status_f", "age_group", "gender", "race", "bmi", "diabetes_f", "smoking_ever_f", "hypertension_f"); missing_cols_agecat <- required_vars_agecat[!required_vars_agecat %in% names(nhanes_analysis_agecat)]; if(length(missing_cols_agecat) > 0) { warning(paste("Skip Age Cat model: Cols missing:", paste(missing_cols_agecat, collapse=", "))) } else {
+        adj_data_subset_agecat <- nhanes_analysis_agecat %>% select(all_of(required_vars_agecat)) %>% na.omit(); cat("Subset dimensions Age Cat:", dim(adj_data_subset_agecat), "\n"); if(nrow(adj_data_subset_agecat) > 10 && length(unique(adj_data_subset_agecat$chd_status)) > 1 && length(levels(droplevels(factor(adj_data_subset_agecat$gout_status_f)))) > 1 && length(levels(droplevels(factor(adj_data_subset_agecat$age_group)))) > 1) { adj_model_agecat <- glm(chd_status ~ gout_status_f + age_group + gender + race + bmi + diabetes_f + smoking_ever_f + hypertension_f, family = binomial(link = "logit"), data = adj_data_subset_agecat); cat("\nAdj Model w/ Age Cats:\n"); summ(adj_model_agecat, exp = TRUE, confint = TRUE, digits = 3) } else { warning("Skip Age Cat model: Insufficient data/levels.") } }
+} else { warning("Skipping Sensitivity: nhanes_analysis empty/missing.") }
+cat("--- Block 9: Sensitivity Analysis Complete ---\n")
+
+# --- Block 10: Association ---
+cat("\n--- Starting Block 10: Association (Gout Predicting Diabetes) ---\n")
+gout_diabetes_model <- NULL
+if(exists("nhanes_analysis") && nrow(nhanes_analysis) > 0) { required_vars_gout_diab <- c("diabetes", "gout_status_f", "age", "gender", "race", "bmi"); missing_cols_gout_diab <- required_vars_gout_diab[!required_vars_gout_diab %in% names(nhanes_analysis)]; if(length(missing_cols_gout_diab) > 0) { warning(paste("Skip G->D model: Cols missing:", paste(missing_cols_gout_diab, collapse=", "))) } else {
+    gout_diab_subset <- nhanes_analysis %>% select(all_of(required_vars_gout_diab)) %>% na.omit(); cat("Subset dimensions G->D:", dim(gout_diab_subset), "\n"); if(nrow(gout_diab_subset) > 10 && length(unique(gout_diab_subset$diabetes)) > 1 && length(levels(droplevels(factor(gout_diab_subset$gout_status_f)))) > 1) { gout_diabetes_model <- glm(diabetes ~ gout_status_f + age + gender + race + bmi, family = binomial(link = "logit"), data = gout_diab_subset); cat("\nAdj Model Gout -> Diabetes:\n"); summ(gout_diabetes_model, exp = TRUE, confint = TRUE, digits = 3) } else { warning("Skip G->D model: Insufficient data/levels.") } }
+} else { warning("Skipping G->D Association: nhanes_analysis empty/missing.") }
+cat("--- Block 10: Association Exploration Complete ---\n")
+
+# --- Block 11: Forest Plot ---
+cat("\n--- Starting Block 11: Visualization (Forest Plot) ---\n")
+forest_plot <- NULL
+if (exists("adj_model") && inherits(adj_model, "glm")) { if (!requireNamespace("effects", quietly = TRUE)) { warning("Package 'effects' needed.") } ; cat("Generating Forest Plot...\n"); forest_plot <- jtools::plot_summs(adj_model, exp = TRUE, scale = FALSE, plot.distributions = FALSE, inner_ci_level = .95); print(forest_plot); cat("Forest plot generated.\n")
+} else { warning("Adj model missing/not glm. Skipping forest plot.") }
+cat("--- Block 11: Forest Plot Complete ---\n")
+
+#-------------------------------------------------------------------------------
+# Block 12: Additional Visualizations (Combined)
+#-------------------------------------------------------------------------------
+cat("\n--- Starting Block 12: Additional Visualizations ---\n")
+# Initialize plot objects
+plot_age_dist <- NULL; plot_bmi_dist <- NULL; plot_diabetes_prop <- NULL;
+plot_age_boxplot <- NULL; plot_pred_prob <- NULL; plot_age_violin_gout <- NULL; plot_bmi_violin_chd <- NULL;
+
+if (exists("nhanes_analysis") && nrow(nhanes_analysis) > 0) {
+  # --- 1. Age Density by CHD ---
+  if ("age" %in% names(nhanes_analysis) && "chd_status_f" %in% names(nhanes_analysis)) { tryCatch({ plot_age_dist <- ggplot(nhanes_analysis, aes(x = age, fill = chd_status_f)) + geom_density(alpha = 0.6) + scale_fill_manual(values = c("No CHD" = "skyblue", "CHD" = "salmon")) + labs(title = "Distribution of Age by CHD Status", x = "Age (Years)", y = "Density", fill = "CHD Status") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5)); print(plot_age_dist); cat("Generated Age Distribution plot.\n") }, error=function(e) warning("Age Dist plot failed: ", e$message)) } else { warning("Skip Age Dist plot: vars missing.") }
+  # --- 2. BMI Density by Gout ---
+  if ("bmi" %in% names(nhanes_analysis) && "gout_status_f" %in% names(nhanes_analysis)) { tryCatch({ plot_bmi_dist <- ggplot(nhanes_analysis, aes(x = bmi, fill = gout_status_f)) + geom_density(alpha = 0.6, na.rm = TRUE) + coord_cartesian(xlim = c(15, 60)) + scale_fill_manual(values = c("No Gout" = "lightgreen", "Gout" = "orange")) + labs(title = "Distribution of BMI by Gout Status", x = "BMI (kg/m^2)", y = "Density", fill = "Gout Status") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5)); print(plot_bmi_dist); cat("Generated BMI Distribution plot.\n") }, error=function(e) warning("BMI Dist plot failed: ", e$message)) } else { warning("Skip BMI Dist plot: vars missing.") }
+  # --- 3. Diabetes Proportions by Gout/CHD ---
+  if (all(c("diabetes_f", "gout_status_f", "chd_status_f") %in% names(nhanes_analysis))) { tryCatch({ plot_diabetes_prop <- ggplot(nhanes_analysis %>% filter(!is.na(diabetes_f)), aes(x = gout_status_f, fill = diabetes_f)) + geom_bar(position = "fill") + facet_wrap(~ chd_status_f) + scale_y_continuous(labels = scales::percent_format()) + scale_fill_manual(values = c("No Diabetes" = "cornflowerblue", "Diabetes" = "tomato"), name = "Diabetes Status") + labs(title = "Proportion Diabetes by Gout/CHD Status", x = "Gout Status", y = "Proportion") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5), strip.text = element_text(face="bold")); print(plot_diabetes_prop); cat("Generated Diabetes Proportion plot.\n") }, error=function(e) warning("Diabetes Prop plot failed: ", e$message)) } else { warning("Skip Diabetes Prop plot: vars missing.") }
+  # --- 4. Age Boxplot by Gout/CHD ---
+  if (all(c("age", "gout_status_f", "chd_status_f") %in% names(nhanes_analysis))) { tryCatch({ plot_age_boxplot <- ggplot(nhanes_analysis, aes(x = gout_status_f, y = age, fill = chd_status_f)) + geom_boxplot(na.rm = TRUE, outlier.shape = NA) + scale_fill_manual(values = c("No CHD" = "skyblue", "CHD" = "salmon"), name = "CHD Status") + labs(title = "Age Distribution by Gout and CHD Status", x = "Gout Status", y = "Age (Years)") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5)); print(plot_age_boxplot); cat("Generated Age Boxplot.\n") }, error=function(e) warning("Age Boxplot failed: ", e$message)) } else { warning("Skip Age Boxplot: vars missing.") }
+  # --- 5. Age Violin by Gout ---
+  if ("age" %in% names(nhanes_analysis) && "gout_status_f" %in% names(nhanes_analysis)) { tryCatch({ plot_age_violin_gout <- ggplot(nhanes_analysis, aes(x = gout_status_f, y = age, fill = gout_status_f)) + geom_violin(trim = FALSE, na.rm = TRUE, alpha=0.7) + geom_boxplot(width = 0.1, fill="white", na.rm=TRUE, outlier.shape = NA) + scale_fill_manual(values = c("No Gout" = "lightgreen", "Gout" = "orange"), guide = "none") + labs(title = "Age Distribution by Gout Status", x = "Gout Status", y = "Age (Years)") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5)); print(plot_age_violin_gout); cat("Generated Age Violin plot (Gout).\n") }, error=function(e) warning("Age Violin Gout plot failed: ", e$message)) } else { warning("Skip Age Violin Gout plot: vars missing.") }
+  # --- 6. BMI Violin by CHD ---
+   if ("bmi" %in% names(nhanes_analysis) && "chd_status_f" %in% names(nhanes_analysis)) { tryCatch({ plot_bmi_violin_chd <- ggplot(nhanes_analysis, aes(x = chd_status_f, y = bmi, fill = chd_status_f)) + geom_violin(trim = FALSE, na.rm = TRUE, alpha=0.7) + geom_boxplot(width = 0.1, fill="white", na.rm=TRUE, outlier.shape = NA) + coord_cartesian(ylim = c(15, 60)) + scale_fill_manual(values = c("No CHD" = "skyblue", "CHD" = "salmon"), guide="none") + labs(title = "BMI Distribution by CHD Status", x = "CHD Status", y = "BMI (kg/m^2)") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5)); print(plot_bmi_violin_chd); cat("Generated BMI Violin plot (CHD).\n") }, error=function(e) warning("BMI Violin CHD plot failed: ", e$message)) } else { warning("Skip BMI Violin CHD plot: vars missing.") }
+  # --- 7. Predicted Probabilities ---
+  cat("\nGenerating Predicted Probabilities Plot...\n")
+  if (exists("adj_model") && inherits(adj_model, "glm")) { if (requireNamespace("ggeffects", quietly = TRUE)) { pred_prob_data <- tryCatch(ggeffects::ggpredict(adj_model, terms = c("age [all]", "gout_status_f")), error = function(e) {warning("ggpredict failed: ", e$message); NULL}); if(!is.null(pred_prob_data)){ plot_pred_prob <- plot(pred_prob_data) + labs(title = "Predicted Probability of CHD by Age & Gout Status", x = "Age (Years)", y = "Predicted Probability of CHD", colour = "Gout Status") + theme_minimal() + theme(plot.title = element_text(hjust = 0.5)); print(plot_pred_prob); cat("Generated Predicted Probability plot.\n") } } else { warning("Package 'ggeffects' needed for pred prob plot.") } } else { warning("Adj model missing/not glm. Skipping pred prob plot.") }
+} else { warning("Skipping Add'l Visualizations: nhanes_analysis empty/missing.") }
+cat("--- Block 12: Additional Visualizations Complete ---\n")
+
+
+#-------------------------------------------------------------------------------
+# Block 13: Export Results (Prioritizing CSV) - Renumbered
+#-------------------------------------------------------------------------------
+cat("\n--- Starting Block 13: Exporting Results (Prioritizing CSV) ---\n")
+output_dir <- "nhanes_gout_chd_results_csv"
+if (!dir.exists(output_dir)) { dir.create(output_dir); cat("Created output directory:", output_dir, "\n") } else { cat("Output directory exists:", output_dir, "\n") }
+if (!requireNamespace("broom", quietly = TRUE)) { warning("Package 'broom' needed for CSV model results."); can_save_tidy <- FALSE } else { can_save_tidy <- TRUE }
+save_tidy_model <- function(model, filename_base, model_desc) { if (exists(deparse(substitute(model)), inherits = FALSE) && inherits(model, "glm") && can_save_tidy) { tryCatch({ model_tidy <- broom::tidy(model, conf.int = TRUE, exponentiate = TRUE); write.csv(model_tidy, file.path(output_dir, paste0(filename_base, "_tidy.csv")), row.names = FALSE, na = ""); cat("Saved", model_desc, "tidy CSV\n") }, error = function(e) warning("Err save tidy ", deparse(substitute(model)), ": ", e$message)) } else { if(!exists(deparse(substitute(model)), inherits=FALSE)) warning("Skip tidy CSV: '", deparse(substitute(model)), "' not found.") } }
+save_plot <- function(plot_obj, filename_base, plot_desc) { if (exists(deparse(substitute(plot_obj)), inherits = FALSE) && inherits(plot_obj, "ggplot")) { tryCatch({ ggsave(filename = file.path(output_dir, paste0(filename_base, ".png")), plot = plot_obj, width = 7, height = 5, dpi = 300); cat("Saved", plot_desc, "plot (PNG)\n") }, error=function(e) warning("Err save plot ", deparse(substitute(plot_obj)), ": ", e$message)) } else { warning("Skip save plot: '", deparse(substitute(plot_obj)), "' not found/not ggplot.") } }
+
+# --- Exporting ---
+# Table 1
+if (exists("table1") && inherits(table1, "TableOne")) { tryCatch({ table1_df <- print(table1, smd = TRUE, printToggle = FALSE, showAllLevels = TRUE, missing = TRUE, varLabels = TRUE, quote = FALSE, noSpaces = TRUE); table1_df_for_csv <- data.frame(Characteristic = rownames(table1_df), table1_df, check.names = FALSE); write.csv(table1_df_for_csv, file.path(output_dir, "table1_descriptive_stats.csv"), row.names = FALSE, na = ""); cat("Saved Table 1 CSV\n") }, error = function(e) { warning("CSV save failed for Table 1. Error: ", e$message); sink(file.path(output_dir, "table1_descriptive_stats.txt"));cat("Table 1:\n");print(table1,smd=T);sink();cat("Saved Table 1 text fallback\n")}) } else { warning("Skip Table 1 export.") }
+# Contingency Table
+if (exists("contingency_table") && inherits(contingency_table, "table")) { write.csv(as.data.frame.matrix(contingency_table), file.path(output_dir, "bivar_contingency_table.csv"), row.names = TRUE); cat("Saved Contingency Table CSV\n") } else { warning("Skip Contingency Table export.") }
+# Chi-Sq
+if (exists("chisq_result") && inherits(chisq_result, "htest")) { sink(file.path(output_dir, "bivar_chisq_test.txt")); cat("Chi-squared Test:\n\n"); print(chisq_result); sink(); cat("Saved Chi-sq text\n") } else { warning("Skip Chi-sq export.") }
+# Models (CSV Preferred)
+save_tidy_model(unadj_model, "unadj_model", "Unadjusted Model")
+save_tidy_model(adj_model, "adj_model", "Adjusted Model")
+save_tidy_model(interaction_model_gender, "interaction_model_gender", "Interaction Model (Gout*Gender)")
+save_tidy_model(adj_model_males, "stratified_model_males", "Stratified Model (Males)")
+save_tidy_model(adj_model_females, "stratified_model_females", "Stratified Model (Females)")
+save_tidy_model(adj_model_agecat, "sensitivity_model_agecat", "Sensitivity Model (Age Cat)")
+save_tidy_model(gout_diabetes_model, "association_gout_diabetes", "Gout->Diabetes Model")
+# Plots
+save_plot(p, "bar_plot_chd_by_gout", "Basic Bar Plot")
+save_plot(forest_plot, "forest_plot_adj_model", "Forest Plot")
+save_plot(plot_age_dist, "plot_age_distribution_by_chd", "Age Distribution Plot")
+save_plot(plot_bmi_dist, "plot_bmi_distribution_by_gout", "BMI Distribution Plot")
+save_plot(plot_diabetes_prop, "plot_diabetes_proportion_by_gout_chd", "Diabetes Proportion Plot")
+save_plot(plot_age_boxplot, "plot_age_boxplot_by_gout_chd", "Age Boxplot")
+save_plot(plot_age_violin_gout, "plot_age_violin_by_gout", "Age Violin Plot (Gout)")
+save_plot(plot_bmi_violin_chd, "plot_bmi_violin_by_chd", "BMI Violin Plot (CHD)")
+save_plot(plot_pred_prob, "plot_predicted_probability_chd", "Predicted Probability Plot")
+cat("--- Block 13: Exporting Results Complete ---\n")
+
+
+#-------------------------------------------------------------------------------
+# Block 14: Save Final Analysis Dataset to Working Directory - Renumbered
+#-------------------------------------------------------------------------------
+cat("\n--- Starting Block 14: Saving Final Dataset ---\n")
+output_filename <- "nhanes_gout_chd_analysis_data.rds"
+if (exists("nhanes_analysis") && nrow(nhanes_analysis) > 0) { saveRDS(nhanes_analysis, file = output_filename); cat("Successfully saved final analysis dataset to:", file.path(getwd(), output_filename), "\n"); cat('\nLoad using: my_loaded_data <- readRDS("', output_filename, '")\n', sep="")
+} else { warning("Skipping save: 'nhanes_analysis' empty/missing.") }
+cat("--- Block 14: Saving Final Dataset Complete ---\n")
+
+cat("\n\n SCRIPT EXECUTION FINISHED \n\n")
